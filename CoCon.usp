@@ -1,0 +1,184 @@
+#SYMBOL_NAME "CoCon"
+#DEFINE_CONSTANT 	MICQ	39
+#DEFAULT_VOLATILE
+#ENABLE_STACK_CHECKING
+#ENABLE_TRACE
+
+
+DIGITAL_INPUT connect, TV_init, clear, mic[MICQ,MICQ];
+
+DIGITAL_OUTPUT MicChanged, CoConConnect, defaultpos, cam1, cam2, cam3, mic_fb[MICQ,MICQ];
+STRING_OUTPUT CoconTX, debug;
+ANALOG_OUTPUT LastSeat, ConnectionState;
+
+TCP_CLIENT TV_Client[1500];
+
+STRING_PARAMETER TV_IP[15], seat[MICQ][3];
+
+STRING ConnectionID[36], Trailer[100];
+
+/*******************************************************************************************
+  Functions
+*******************************************************************************************/
+
+Function Notify()
+{
+STRING TV_TX[200];
+	if (Len(ConnectionID)<>0)
+	{
+		TV_TX = "GET /CoCon/Notification/id=" + ConnectionID + Trailer;
+		SocketSend(TV_Client, TV_TX);
+	}
+}
+ 
+Function MicOn(STRING SeatNr)
+{
+	if (Len(ConnectionID)<>0)
+	{
+		CoConConnect = 1;
+		Delay(5);
+		CoconTX = "GET /CoCon/Microphone/SetState/?State=On&SeatNr=" + SeatNr + Trailer;
+		CoConConnect = 0;
+	}
+}
+
+Function MicOff(STRING SeatNr)
+{
+	if (Len(ConnectionID)<>0)
+	{
+		CoConConnect = 1;
+		Delay(5);
+		CoconTX = "GET /CoCon/Microphone/SetState/?State=Off&SeatNr=" + SeatNr + Trailer;
+		CoConConnect = 0;
+	}
+}
+
+/*******************************************************************************************
+  Event Handlers
+*******************************************************************************************/
+PUSH connect
+{
+	SocketConnectClient (TV_Client, TV_IP, 8890, 1);
+	Trailer = " HTTP/1.1\r\nHost: " + TV_IP + "\r\nContent-Length: 0\r\n\r\n";
+}
+
+SOCKETSTATUS TV_Client
+{
+	ConnectionState = SocketGetStatus();
+}
+
+PUSH TV_init
+{
+	STRING TV_TX[200];
+	TV_TX = "GET /CoCon/Connect" + Trailer;
+	SocketSend(TV_Client, TV_TX);
+}
+
+THREADSAFE PUSH mic
+{
+	INTEGER i;
+	i = GetLastModifiedArrayIndex();
+	if (mic_fb[i]) MicOff(seat[i]); else MicOn(seat[i]);
+}
+
+THREADSAFE PUSH clear
+{
+	if (Len(ConnectionID)<>0)
+	{
+		CoConConnect = 1;
+		Delay(5);
+		CoconTX = "GET /CoCon/Microphone/ClearMicrophoneList/?Type=SpeakersAndRequests" + Trailer;
+		CoConConnect = 0;
+	}
+}
+
+
+SOCKETRECEIVE TV_Client
+{
+	STRING SeatNr[3], Parse[200], TV_RX[1500], TV_TX[200];
+	INTEGER i, j, Pos, changer, fl, mic_tmp[MICQ];
+	TV_RX = TV_Client.SocketRxBuf;
+	ClearBuffer(TV_Client.SocketRxBuf);
+		if ((Find("Bad",TV_RX))||(Find("Internal",TV_RX)))
+		{
+			TV_TX = "GET /CoCon/Connect" + Trailer;
+			Delay(200);
+			SocketSend(TV_Client, TV_TX);
+		}
+		else if (Find("Connect", TV_RX))
+		{
+			ConnectionID = Mid(TV_RX, Find("id", TV_RX)+7, 36);
+			TV_TX = "GET /CoCon/Microphone/GetState" + Trailer;
+			SocketSend(TV_Client, TV_TX);
+		}
+
+		else if ((Find("GetState",TV_RX))||(Find("MicrophoneState",TV_RX)))
+		{
+			changer = 1;
+			i = 1;
+			SetArray(mic_tmp, 0);
+			Pos = ReverseFind("Speakers", TV_RX)+12;
+			Parse = Mid(TV_RX, Pos, Find("]", TV_RX, Pos)-Pos);
+			Pos = Len(Parse);
+			While (Pos)
+			{
+				SeatNr = "";
+				if (Mid(Parse, Pos, 1)=",") Pos = Pos - 1;
+				SeatNr = Mid(Parse, Pos, 1);
+				Pos = Pos - 1;
+				if ((Pos)&&(Mid(Parse, Pos, 1)<>","))
+				{
+					SeatNr = Mid(Parse, Pos, 1) + SeatNr;
+					Pos = Pos - 1;
+				}
+				mic_tmp[i] = AtoI(SeatNr);
+				if (changer) {LastSeat = mic_tmp[i]; changer = 0;}
+				i = i + 1;
+			}
+			if(changer) 
+			{
+				LastSeat = 0;
+				SetArray(mic_fb, 0);
+                Pulse(1, defaultpos);
+			}
+			else
+			{
+				Pos = i - 1;
+				for(j = 1 to Pos-1)
+				{
+					fl = 0;
+					for(i = 1 to Pos - j)
+					{
+						if(mic_tmp[i]>mic_tmp[i+1])
+						{
+							changer = mic_tmp[i];
+							mic_tmp[i] = mic_tmp[i+1];
+							mic_tmp[i+1] = changer;
+							fl = 1;
+						}
+					}
+					if(fl = 0) break;
+				}
+				if((LastSeat <= 3) || (LastSeat = 38)) Pulse(1, cam1);
+				else if(((LastSeat >= 4) && (LastSeat <= 14)) || ((LastSeat >= 21) && (LastSeat <= 26))) Pulse(1, cam2);
+				else if(((LastSeat >= 15) && (LastSeat <= 20)) || ((LastSeat >= 27) && (LastSeat <= 37))) Pulse(1, cam3);				
+
+				j = 1;
+				for(i = 1 to MICQ)
+				{
+					if(mic_tmp[j] = i)
+					{
+						mic_fb[i] = 1;
+						j = j + 1;
+					}
+					else mic_fb[i] = 0;
+				}
+			}
+
+			//if(LastSeat<>39)
+			Pulse(1, MicChanged);
+			Notify();
+		}
+		else if (Find("timeout", TV_RX) = 0) Notify(); 		
+}
+
